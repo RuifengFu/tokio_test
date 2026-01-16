@@ -8,7 +8,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -18,6 +18,8 @@ DEFAULT_REPO = "tokio"
 DEFAULT_PER_PAGE = 100
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "issues.json"
 API_ROOT = "https://api.github.com"
+API_TIMEOUT = 30
+MAX_TEXT_LENGTH = 20000
 
 
 def load_issue_store(path: Path) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
@@ -43,17 +45,20 @@ def load_issue_store(path: Path) -> Tuple[Dict[str, Any], Dict[int, Dict[str, An
 
 
 def save_issue_store(path: Path, data: Dict[str, Any], issues: Dict[int, Dict[str, Any]]) -> None:
-    data = dict(data)
-    data["issues"] = sorted(issues.values(), key=lambda item: item.get("number", 0))
-    data["fetched_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    data["issue_count"] = len(data["issues"])
+    data_copy = dict(data)
+    data_copy["issues"] = sorted(issues.values(), key=lambda item: item.get("number", 0))
+    data_copy["fetched_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    data_copy["issue_count"] = len(data_copy["issues"])
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+        json.dump(data_copy, handle, ensure_ascii=False, indent=2)
 
 
 def get_token() -> Optional[str]:
-    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and token.strip():
+        return token.strip()
+    return None
 
 
 def parse_github_datetime(value: str) -> Optional[datetime]:
@@ -84,7 +89,10 @@ def latest_updated_at(issues: Dict[int, Dict[str, Any]]) -> Optional[str]:
     return to_github_iso(max(timestamps))
 
 
-def request_json(url: str, token: Optional[str]) -> Tuple[Any, str]:
+def request_json(
+    url: str, token: Optional[str]
+) -> Tuple[Union[Dict[str, Any], List[Dict[str, Any]]], str]:
+    ensure_api_url(url)
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "tokio-issue-scraper",
@@ -93,13 +101,29 @@ def request_json(url: str, token: Optional[str]) -> Tuple[Any, str]:
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, headers=headers)
     try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with urlopen(request, timeout=API_TIMEOUT) as response:
+            raw_payload = response.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("GitHub API response was not valid JSON.") from exc
             link = response.headers.get("Link", "")
             return payload, link
     except HTTPError as exc:
-        details = exc.read().decode("utf-8") if exc.fp else str(exc)
-        raise RuntimeError(f"GitHub API request failed ({exc.code}): {details}") from exc
+        error_stream = getattr(exc, "fp", None)
+        details = ""
+        if error_stream:
+            try:
+                details = error_stream.read().decode("utf-8", errors="replace")
+            finally:
+                error_stream.close()
+        message = details or str(exc)
+        if details:
+            try:
+                message = json.loads(details).get("message", details)
+            except json.JSONDecodeError:
+                message = details
+        raise RuntimeError(f"GitHub API request failed ({exc.code}): {message}") from exc
     except URLError as exc:
         raise RuntimeError(f"GitHub API request failed: {exc.reason}") from exc
 
@@ -123,6 +147,13 @@ def parse_link_header(link_header: str) -> Dict[str, str]:
     return links
 
 
+def ensure_api_url(url: str) -> None:
+    parsed = urlparse(url)
+    api_host = urlparse(API_ROOT).netloc
+    if parsed.scheme != "https" or parsed.netloc != api_host:
+        raise RuntimeError(f"Refusing to fetch non-GitHub API URL: {url}")
+
+
 def build_url(base: str, params: Dict[str, Any]) -> str:
     parsed = urlparse(base)
     query = parse_qs(parsed.query)
@@ -130,18 +161,38 @@ def build_url(base: str, params: Dict[str, Any]) -> str:
         if value is None:
             continue
         query[key] = [str(value)]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query, doseq=True),
+            parsed.fragment,
+        )
+    )
 
 
-def fetch_paginated(url: str, token: Optional[str]) -> List[Any]:
-    results: List[Any] = []
+def truncate_text(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    if len(text) <= MAX_TEXT_LENGTH:
+        return text
+    return f"{text[:MAX_TEXT_LENGTH]}... [truncated]"
+
+
+def fetch_paginated(url: str, token: Optional[str]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
     next_url = url
     while next_url:
         payload, link = request_json(next_url, token)
         if isinstance(payload, dict):
-            results.extend(payload.get("items", []))
+            items: Iterable[Any] = payload.get("items", [])
         else:
-            results.extend(payload)
+            items = payload
+        for item in items:
+            if isinstance(item, dict):
+                results.append(item)
         next_url = parse_link_header(link).get("next")
     return results
 
@@ -185,7 +236,7 @@ def build_issue_record(issue: Dict[str, Any], comments: List[Dict[str, Any]]) ->
         "labels": labels,
         "assignees": [assignee for assignee in assignees if assignee],
         "comments_count": issue.get("comments"),
-        "body": issue.get("body"),
+        "body": truncate_text(issue.get("body")),
         "comments": comments,
     }
 
@@ -196,7 +247,7 @@ def build_comment_record(comment: Dict[str, Any]) -> Dict[str, Any]:
         "user": build_user(comment.get("user")),
         "created_at": comment.get("created_at"),
         "updated_at": comment.get("updated_at"),
-        "body": comment.get("body"),
+        "body": truncate_text(comment.get("body")),
     }
 
 
@@ -217,14 +268,14 @@ def fetch_issues(owner: str, repo: str, token: Optional[str], since: Optional[st
     }
     url = build_url(base_url, params)
     issues = fetch_paginated(url, token)
-    return [issue for issue in issues if isinstance(issue, dict) and "pull_request" not in issue]
+    return [issue for issue in issues if not issue.get("pull_request")]
 
 
 def format_bar(value: int, maximum: int, width: int = 40) -> str:
     if maximum <= 0:
         return ""
-    length = max(1, int(round((value / maximum) * width))) if value else 0
-    return "█" * length
+    length = int(round((value / maximum) * width))
+    return "█" * length if length > 0 else ""
 
 
 def summarize_labels(issues: Iterable[Dict[str, Any]], top: Optional[int]) -> None:
@@ -283,7 +334,15 @@ def run_fetch(args: argparse.Namespace) -> None:
     if args.repo:
         data["repo"] = args.repo
     token = get_token()
-    since = None if args.full_refresh else (args.since or latest_updated_at(issues_map))
+    if not token:
+        print(
+            "Warning: no GitHub token detected. Set GITHUB_TOKEN or GH_TOKEN to avoid rate limits.",
+            file=sys.stderr,
+        )
+    if args.full_refresh:
+        since = None
+    else:
+        since = args.since or latest_updated_at(issues_map)
     if since:
         print(f"Fetching issues updated since {since}...")
     else:
@@ -291,11 +350,27 @@ def run_fetch(args: argparse.Namespace) -> None:
     issues = fetch_issues(data["owner"], data["repo"], token, since)
     for issue in issues:
         number = issue.get("number")
-        if not isinstance(number, int):
+        if not isinstance(number, int) or number <= 0:
+            print(
+                f"Skipping issue with invalid number (expected positive integer): {number!r}",
+                file=sys.stderr,
+            )
             continue
         comments: List[Dict[str, Any]] = []
-        if args.include_comments and issue.get("comments", 0):
-            comments = fetch_issue_comments(issue.get("comments_url"), token)
+        if args.include_comments:
+            comments_url = issue.get("comments_url")
+            if issue.get("comments", 0) > 0 and comments_url:
+                try:
+                    comments = fetch_issue_comments(comments_url, token)
+                except RuntimeError as exc:
+                    comments = []
+                    print(
+                        (
+                            f"Warning: failed to fetch comments for #{number}: {exc}. "
+                            "Saving the issue without comments."
+                        ),
+                        file=sys.stderr,
+                    )
         record = build_issue_record(issue, comments)
         issues_map[number] = record
     save_issue_store(output, data, issues_map)
@@ -309,8 +384,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     fetch_parser = subparsers.add_parser("fetch", help="Fetch issues and store them locally")
-    fetch_parser.add_argument("--owner", default=DEFAULT_OWNER, help="GitHub owner (default: tokio-rs)")
-    fetch_parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository (default: tokio)")
+    fetch_parser.add_argument(
+        "--owner",
+        default=DEFAULT_OWNER,
+        help=f"GitHub owner (default: {DEFAULT_OWNER})",
+    )
+    fetch_parser.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        help=f"GitHub repository (default: {DEFAULT_REPO})",
+    )
     fetch_parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Path to the output JSON file")
     fetch_parser.add_argument(
         "--since",
